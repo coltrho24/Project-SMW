@@ -1,0 +1,6 @@
+torch
+matplotlib
+stable-retro
+gymnasium
+numpy
+ipykernel
