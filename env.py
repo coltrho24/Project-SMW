@@ -1,95 +1,122 @@
 # -*- coding: utf-8 -*-
 from collections import deque
 import random
-import atari_py
 import cv2
 import torch
+import stable_retro
+import numpy as np
 
 
 class Env():
   def __init__(self, args):
     self.device = args.device
-    self.ale = atari_py.ALEInterface()
-    self.ale.setInt('random_seed', args.seed)
-    self.ale.setInt('max_num_frames_per_episode', args.max_episode_length)
-    self.ale.setFloat('repeat_action_probability', 0)  # Disable sticky actions
-    self.ale.setInt('frame_skip', 0)
-    self.ale.setBool('color_averaging', False)
-    self.ale.loadROM(atari_py.get_game_path(args.game))  # ROM loading must be done after setting options
-    actions = self.ale.getMinimalActionSet()
-    self.actions = dict([i, e] for i, e in zip(range(len(actions)), actions))
-    self.lives = 0  # Life counter (used in DeepMind training)
-    self.life_termination = False  # Used to check if resetting only from loss of life
-    self.window = args.history_length  # Number of frames to concatenate
+    self.env = stable_retro.make(
+      game='SuperMarioWorld-Snes',
+      state=getattr(args, 'smw_state', stable_retro.State.DEFAULT),
+      render_mode=None,
+    )
+    self.env.seed(args.seed)
+    # Map integer actions to MultiBinary button combos
+    # Use a reduced discrete set: no-op, right, right+A (jump), right+B (run), right+A+B
+    self._actions = [
+      [0,0,0,0,0,0,0,0,0,0,0,0],  # no-op
+      [0,0,0,0,0,0,1,0,0,0,0,0],  # right
+      [0,0,0,0,0,0,1,0,1,0,0,0],  # right + A (jump)
+      [0,0,0,0,0,0,1,0,0,1,0,0],  # right + B (run/spin)
+      [0,0,0,0,0,0,1,0,1,1,0,0],  # right + A + B
+      [0,0,0,0,0,0,0,0,1,0,0,0],  # A only (jump in place)
+    ]
+    self.lives = 0
+    self.life_termination = False
+    self.window = args.history_length
     self.state_buffer = deque([], maxlen=args.history_length)
-    self.training = True  # Consistent with model training mode
+    self.training = True
+    self._max_episode_length = args.max_episode_length
+    self._step_count = 0
 
   def _get_state(self):
-    state = cv2.resize(self.ale.getScreenGrayscale(), (84, 84), interpolation=cv2.INTER_LINEAR)
-    return torch.tensor(state, dtype=torch.float32, device=self.device).div_(255)
+    # env.render() returns the current frame as RGB numpy array
+    frame = self.env.render()
+    if frame is None:
+      # Fall back to observation if render returns None
+      frame = self._last_obs
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_LINEAR)
+    return torch.tensor(resized, dtype=torch.float32, device=self.device).div_(255)
 
   def _reset_buffer(self):
     for _ in range(self.window):
       self.state_buffer.append(torch.zeros(84, 84, device=self.device))
 
+  def _get_lives(self):
+    # RAM address for lives in SMW — adjust if needed
+    ram = self.env.get_ram()
+    return int(ram[0x0DBE])
+
   def reset(self):
     if self.life_termination:
-      self.life_termination = False  # Reset flag
-      self.ale.act(0)  # Use a no-op after loss of life
+      self.life_termination = False
+      # Step with no-op to continue after life loss
+      obs, _, _, _, _ = self.env.step(self._actions[0])
+      self._last_obs = obs
     else:
-      # Reset internals
       self._reset_buffer()
-      self.ale.reset_game()
-      # Perform up to 30 random no-ops before starting
+      obs, _ = self.env.reset()
+      self._last_obs = obs
+      self._step_count = 0
+      # Up to 30 random no-op steps
       for _ in range(random.randrange(30)):
-        self.ale.act(0)  # Assumes raw action 0 is always no-op
-        if self.ale.game_over():
-          self.ale.reset_game()
-    # Process and return "initial" state
+        obs, _, terminated, truncated, _ = self.env.step(self._actions[0])
+        self._last_obs = obs
+        if terminated or truncated:
+          obs, _ = self.env.reset()
+          self._last_obs = obs
     observation = self._get_state()
     self.state_buffer.append(observation)
-    self.lives = self.ale.lives()
+    self.lives = self._get_lives()
     return torch.stack(list(self.state_buffer), 0)
 
   def step(self, action):
-    # Repeat action 4 times, max pool over last 2 frames
     frame_buffer = torch.zeros(2, 84, 84, device=self.device)
     reward, done = 0, False
+    buttons = self._actions[action]
     for t in range(4):
-      reward += self.ale.act(self.actions.get(action))
+      obs, r, terminated, truncated, _ = self.env.step(buttons)
+      self._last_obs = obs
+      self._step_count += 1
+      reward += r
       if t == 2:
         frame_buffer[0] = self._get_state()
       elif t == 3:
         frame_buffer[1] = self._get_state()
-      done = self.ale.game_over()
+      done = terminated or truncated or (self._step_count >= self._max_episode_length)
       if done:
         break
     observation = frame_buffer.max(0)[0]
     self.state_buffer.append(observation)
-    # Detect loss of life as terminal in training mode
     if self.training:
-      lives = self.ale.lives()
-      if lives < self.lives and lives > 0:  # Lives > 0 for Q*bert
-        self.life_termination = not done  # Only set flag when not truly done
+      lives = self._get_lives()
+      if lives < self.lives and lives > 0:
+        self.life_termination = not done
         done = True
       self.lives = lives
-    # Return state, reward, done
     return torch.stack(list(self.state_buffer), 0), reward, done
 
-  # Uses loss of life as terminal signal
   def train(self):
     self.training = True
 
-  # Uses standard terminal signal
   def eval(self):
     self.training = False
 
   def action_space(self):
-    return len(self.actions)
+    return len(self._actions)
 
   def render(self):
-    cv2.imshow('screen', self.ale.getScreenRGB()[:, :, ::-1])
-    cv2.waitKey(1)
+    frame = self.env.render()
+    if frame is not None:
+      cv2.imshow('screen', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+      cv2.waitKey(1)
 
   def close(self):
     cv2.destroyAllWindows()
+    self.env.close()
