@@ -60,9 +60,9 @@
       "address": 8258510,
       "type": "|u1"
     },
-    "FINISH": {
-      "address": 8258588,
-      "type": "|u1"
+    "game_mode": {
+      "address": 8257792,
+      "type": "<u2"
     }
   }
 }
