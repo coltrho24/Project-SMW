@@ -4,27 +4,29 @@ import random
 import cv2
 import torch
 import stable_retro
-import numpy as np
 
 
 class Env():
   def __init__(self, args):
     self.device = args.device
     self.env = stable_retro.make(
-      game='SuperMarioWorld-Snes',
+      game='SuperMarioWorld-Snes-v0',
       state=getattr(args, 'smw_state', stable_retro.State.DEFAULT),
-      render_mode=None,
+      render_mode='human'
     )
-    self.env.seed(args.seed)
     # Map integer actions to MultiBinary button combos
-    # Use a reduced discrete set: no-op, right, right+A (jump), right+B (run), right+A+B
+    # Button order: [B, Y, SELECT, START, UP, DOWN, LEFT, RIGHT, A, X, L, R]
+    #                 0  1    2      3    4    5     6     7    8  9  10 11
     self._actions = [
       [0,0,0,0,0,0,0,0,0,0,0,0],  # no-op
-      [0,0,0,0,0,0,1,0,0,0,0,0],  # right
-      [0,0,0,0,0,0,1,0,1,0,0,0],  # right + A (jump)
-      [0,0,0,0,0,0,1,0,0,1,0,0],  # right + B (run/spin)
-      [0,0,0,0,0,0,1,0,1,1,0,0],  # right + A + B
+      [0,0,0,0,0,0,0,1,0,0,0,0],  # right
+      [0,0,0,0,0,0,0,1,1,0,0,0],  # right + A (jump)
+      [0,0,0,0,0,0,0,1,0,0,0,0],  # right + Y (run)
+      [0,0,0,0,0,0,0,1,1,0,0,0],  # right + A + Y (run-jump)
       [0,0,0,0,0,0,0,0,1,0,0,0],  # A only (jump in place)
+      [0,0,0,0,0,0,1,0,0,0,0,0],  # left
+      [0,0,0,0,0,0,1,0,1,0,0,0],  # left + A (jump left)
+      [0,0,0,0,0,0,1,0,0,1,0,0],  # left + Y (run left)
     ]
     self.lives = 0
     self.life_termination = False
@@ -33,14 +35,12 @@ class Env():
     self.training = True
     self._max_episode_length = args.max_episode_length
     self._step_count = 0
+    self._x_pos = 0
+    self._max_x_pos = 0  # Furthest x reached this episode
 
   def _get_state(self):
-    # env.render() returns the current frame as RGB numpy array
-    frame = self.env.render()
-    if frame is None:
-      # Fall back to observation if render returns None
-      frame = self._last_obs
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    # Use the observation directly — calling render() with render_mode=None can block
+    gray = cv2.cvtColor(self._last_obs, cv2.COLOR_RGB2GRAY)
     resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_LINEAR)
     return torch.tensor(resized, dtype=torch.float32, device=self.device).div_(255)
 
@@ -49,42 +49,45 @@ class Env():
       self.state_buffer.append(torch.zeros(84, 84, device=self.device))
 
   def _get_lives(self):
-    # RAM address for lives in SMW — adjust if needed
-    ram = self.env.get_ram()
-    return int(ram[0x0DBE])
+    info = self.env.data.lookup_all()
+    return int(info.get('lives', 4))
+
+  def _get_x(self, info):
+    return int(info.get('screen', 0)) * 256 + int(info.get('x', 0))
 
   def reset(self):
     if self.life_termination:
       self.life_termination = False
-      # Step with no-op to continue after life loss
-      obs, _, _, _, _ = self.env.step(self._actions[0])
+      obs, _, _, _, info = self.env.step(self._actions[0])
       self._last_obs = obs
     else:
       self._reset_buffer()
-      obs, _ = self.env.reset()
+      obs, info = self.env.reset()
       self._last_obs = obs
       self._step_count = 0
-      # Up to 30 random no-op steps
       for _ in range(random.randrange(30)):
-        obs, _, terminated, truncated, _ = self.env.step(self._actions[0])
+        obs, _, terminated, truncated, info = self.env.step(self._actions[0])
         self._last_obs = obs
         if terminated or truncated:
-          obs, _ = self.env.reset()
+          obs, info = self.env.reset()
           self._last_obs = obs
     observation = self._get_state()
     self.state_buffer.append(observation)
     self.lives = self._get_lives()
+    self._x_pos = self._get_x(info)
+    self._max_x_pos = self._x_pos
     return torch.stack(list(self.state_buffer), 0)
 
   def step(self, action):
     frame_buffer = torch.zeros(2, 84, 84, device=self.device)
     reward, done = 0, False
     buttons = self._actions[action]
+    prev_x = self._x_pos
+    last_info = {}
     for t in range(4):
-      obs, r, terminated, truncated, _ = self.env.step(buttons)
+      obs, _, terminated, truncated, last_info = self.env.step(buttons)
       self._last_obs = obs
       self._step_count += 1
-      reward += r
       if t == 2:
         frame_buffer[0] = self._get_state()
       elif t == 3:
@@ -94,12 +97,22 @@ class Env():
         break
     observation = frame_buffer.max(0)[0]
     self.state_buffer.append(observation)
-    if self.training:
-      lives = self._get_lives()
-      if lives < self.lives and lives > 0:
+    # Reward: only for reaching new furthest-right position (no negative spikes from death/knockback)
+    new_x = self._get_x(last_info)
+    reward = max(0, new_x - self._max_x_pos)
+    self._x_pos = new_x
+    self._max_x_pos = max(self._max_x_pos, new_x)
+    # Always check lives — in eval mode too — to avoid game over animation hanging the emulator
+    lives = self._get_lives()
+    if lives < self.lives:
+      if lives <= 0:
+        # Game over imminent: force terminal before the game over screen can hang
+        done = True
+        self.life_termination = False
+      elif self.training:
         self.life_termination = not done
         done = True
-      self.lives = lives
+    self.lives = lives
     return torch.stack(list(self.state_buffer), 0), reward, done
 
   def train(self):

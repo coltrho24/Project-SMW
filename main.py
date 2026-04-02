@@ -5,6 +5,9 @@ import bz2
 from datetime import datetime
 import os
 import pickle
+import csv
+import multiprocessing as mp
+import tempfile
 
 import numpy as np
 import torch
@@ -22,8 +25,8 @@ parser.add_argument('--id', type=str, default='default', help='Experiment ID')
 parser.add_argument('--seed', type=int, default=123, help='Random seed')
 parser.add_argument('--disable-cuda', action='store_true', help='Disable CUDA')
 parser.add_argument('--game', type=str, default='SuperMarioWorld-Snes', help='Game (unused, kept for CLI compatibility)')
-parser.add_argument('--T-max', type=int, default=int(50e6), metavar='STEPS', help='Number of training steps (4x number of frames)')
-parser.add_argument('--max-episode-length', type=int, default=int(108e3), metavar='LENGTH', help='Max episode length in game frames (0 to disable)')
+parser.add_argument('--T-max', type=int, default=int(5e5), metavar='STEPS', help='Number of training steps (4x number of frames)')
+parser.add_argument('--max-episode-length', type=int, default=4500, metavar='LENGTH', help='Max episode length in game frames (0 to disable)')
 parser.add_argument('--history-length', type=int, default=4, metavar='T', help='Number of consecutive states processed')
 parser.add_argument('--architecture', type=str, default='canonical', choices=['canonical', 'data-efficient'], metavar='ARCH', help='Network architecture')
 parser.add_argument('--hidden-size', type=int, default=512, metavar='SIZE', help='Network hidden size')
@@ -48,6 +51,7 @@ parser.add_argument('--learn-start', type=int, default=int(20e3), metavar='STEPS
 parser.add_argument('--evaluate', action='store_true', help='Evaluate only')
 parser.add_argument('--evaluation-interval', type=int, default=100000, metavar='STEPS', help='Number of training steps between evaluations')
 parser.add_argument('--evaluation-episodes', type=int, default=10, metavar='N', help='Number of evaluation episodes to average over')
+parser.add_argument('--evaluation-max-steps', type=int, default=4500, metavar='N', help='Max steps per evaluation episode (4500 ≈ 30s of gameplay)')
 # TODO: Note that DeepMind's evaluation method is running the latest agent for 500K frames ever every 1M steps
 parser.add_argument('--evaluation-size', type=int, default=500, metavar='N', help='Number of transitions to use for validating Q')
 parser.add_argument('--render', action='store_true', help='Display screen (testing only)')
@@ -56,24 +60,30 @@ parser.add_argument('--checkpoint-interval', default=0, help='How often to check
 parser.add_argument('--memory', help='Path to save/load the memory from')
 parser.add_argument('--disable-bzip-memory', action='store_true', help='Don\'t zip the memory file. Not recommended (zipping is a bit slower and much, much smaller)')
 
-# Setup
-args = parser.parse_args()
+if __name__ == '__main__':
+  # Setup
+  args = parser.parse_args()
 
-print(' ' * 26 + 'Options')
-for k, v in vars(args).items():
-  print(' ' * 26 + k + ': ' + str(v))
-results_dir = os.path.join('results', args.id)
-if not os.path.exists(results_dir):
-  os.makedirs(results_dir)
-metrics = {'steps': [], 'rewards': [], 'Qs': [], 'best_avg_reward': -float('inf')}
-np.random.seed(args.seed)
-torch.manual_seed(np.random.randint(1, 10000))
-if torch.cuda.is_available() and not args.disable_cuda:
-  args.device = torch.device('cuda')
-  torch.cuda.manual_seed(np.random.randint(1, 10000))
-  torch.backends.cudnn.enabled = args.enable_cudnn
-else:
-  args.device = torch.device('cpu')
+  print(' ' * 26 + 'Options')
+  for k, v in vars(args).items():
+    print(' ' * 26 + k + ': ' + str(v))
+  results_dir = os.path.join('results', args.id)
+  if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
+  metrics = {'steps': [], 'rewards': [], 'Qs': [], 'best_avg_reward': -float('inf')}
+  log_path = os.path.join('results', args.id, 'train_log.csv')
+  os.makedirs(os.path.join('results', args.id), exist_ok=True)
+  _log_file = open(log_path, 'w', newline='', buffering=1)
+  _csv = csv.writer(_log_file)
+  _csv.writerow(['step', 'phase', 'reward', 'done', 'timestamp'])
+  np.random.seed(args.seed)
+  torch.manual_seed(np.random.randint(1, 10000))
+  if torch.cuda.is_available() and not args.disable_cuda:
+    args.device = torch.device('cuda')
+    torch.cuda.manual_seed(np.random.randint(1, 10000))
+    torch.backends.cudnn.enabled = args.enable_cudnn
+  else:
+    args.device = torch.device('cpu')
 
 
 # Simple ISO 8601 timestamped logger
@@ -99,87 +109,141 @@ def save_memory(memory, memory_path, disable_bzip):
       pickle.dump(memory, zipped_pickle_file)
 
 
-# Environment
-env = Env(args)
-env.train()
-action_space = env.action_space()
-
-# Agent
-dqn = Agent(args, env)
-
-# If a model is provided, and evaluate is false, presumably we want to resume, so try to load memory
-if args.model is not None and not args.evaluate:
-  if not args.memory:
-    raise ValueError('Cannot resume training without memory save path. Aborting...')
-  elif not os.path.exists(args.memory):
-    raise ValueError('Could not find memory file at {path}. Aborting...'.format(path=args.memory))
-
-  mem = load_memory(args.memory, args.disable_bzip_memory)
-
-else:
-  mem = ReplayMemory(args, args.memory_capacity)
-
-priority_weight_increase = (1 - args.priority_weight) / (args.T_max - args.learn_start)
+def _test_worker(args, weights_path, T, val_mem, metrics, results_dir, queue):
+  try:
+    # Use a stub so Agent doesn't create a second emulator instance — test() creates the real one
+    class _EnvStub:
+      def action_space(self):
+        return args._action_space
+    worker_dqn = Agent(args, _EnvStub())
+    worker_dqn.online_net.load_state_dict(torch.load(weights_path, map_location=args.device))
+    worker_dqn.online_net.eval()
+    avg_reward, avg_Q = test(args, T, worker_dqn, val_mem, metrics, results_dir)
+    queue.put((avg_reward, avg_Q))
+  except Exception as e:
+    queue.put(e)
 
 
-# Construct validation memory
-val_mem = ReplayMemory(args, args.evaluation_size)
-T, done = 0, True
-while T < args.evaluation_size:
-  if done:
-    state = env.reset()
+def safe_test(args, T, dqn, val_mem, metrics, results_dir, timeout=120):
+  """Save weights to disk, run test() in a fresh spawn process, kill if it hangs."""
+  with tempfile.NamedTemporaryFile(suffix='.pth', delete=False) as f:
+    weights_path = f.name
+  torch.save(dqn.online_net.state_dict(), weights_path)
+  ctx = mp.get_context('spawn')
+  queue = ctx.Queue()
+  p = ctx.Process(target=_test_worker, args=(args, weights_path, T, val_mem, metrics, results_dir, queue))
+  p.start()
+  p.join(timeout)
+  os.unlink(weights_path)
+  if p.is_alive():
+    log(f'WARNING: eval timed out after {timeout}s — killing and skipping')
+    p.kill()
+    p.join()
+    return None, None
+  result = queue.get()
+  if isinstance(result, Exception):
+    log(f'WARNING: eval raised {result} — skipping')
+    return None, None
+  return result
 
-  next_state, _, done = env.step(np.random.randint(0, action_space))
-  val_mem.append(state, -1, 0.0, done)
-  state = next_state
-  T += 1
 
-if args.evaluate:
-  dqn.eval()  # Set DQN (online network) to evaluation mode
-  avg_reward, avg_Q = test(args, 0, dqn, val_mem, metrics, results_dir, evaluate=True)  # Test
-  print('Avg. reward: ' + str(avg_reward) + ' | Avg. Q: ' + str(avg_Q))
-else:
-  # Training loop
-  dqn.train()
-  done = True
-  for T in trange(1, args.T_max + 1):
+if __name__ == '__main__':
+  # Environment
+  env = Env(args)
+  env.train()
+  action_space = env.action_space()
+  args._action_space = action_space  # Store for subprocess use
+
+  # Agent
+  dqn = Agent(args, env)
+
+  # If a model is provided, and evaluate is false, presumably we want to resume, so try to load memory
+  if args.model is not None and not args.evaluate:
+    if not args.memory:
+      raise ValueError('Cannot resume training without memory save path. Aborting...')
+    elif not os.path.exists(args.memory):
+      raise ValueError('Could not find memory file at {path}. Aborting...'.format(path=args.memory))
+
+    mem = load_memory(args.memory, args.disable_bzip_memory)
+
+  else:
+    mem = ReplayMemory(args, args.memory_capacity)
+
+  priority_weight_increase = (1 - args.priority_weight) / (args.T_max - args.learn_start)
+
+
+  # Construct validation memory
+  val_mem = ReplayMemory(args, args.evaluation_size)
+  T, done = 0, True
+  while T < args.evaluation_size:
     if done:
       state = env.reset()
 
-    if T % args.replay_frequency == 0:
-      dqn.reset_noise()  # Draw a new set of noisy weights
+    next_state, _, done = env.step(np.random.randint(0, action_space))
+    val_mem.append(state, -1, 0.0, done)
+    state = next_state
+    T += 1
 
-    action = dqn.act(state)  # Choose an action greedily (with noisy weights)
-    next_state, reward, done = env.step(action)  # Step
-    if args.reward_clip > 0:
-      reward = max(min(reward, args.reward_clip), -args.reward_clip)  # Clip rewards
-    mem.append(state, action, reward, done)  # Append transition to memory
-
-    # Train and test
-    if T >= args.learn_start:
-      mem.priority_weight = min(mem.priority_weight + priority_weight_increase, 1)  # Anneal importance sampling weight β to 1
+  if args.evaluate:
+    dqn.eval()  # Set DQN (online network) to evaluation mode
+    avg_reward, avg_Q = test(args, 0, dqn, val_mem, metrics, results_dir, evaluate=True)  # Test
+    print('Avg. reward: ' + str(avg_reward) + ' | Avg. Q: ' + str(avg_Q))
+  else:
+    # Training loop
+    dqn.train()
+    done = True
+    _episode_reward = 0
+    for T in trange(1, args.T_max + 1):
+      if done:
+        state = env.reset()
 
       if T % args.replay_frequency == 0:
-        dqn.learn(mem)  # Train with n-step distributional double-Q learning
+        dqn.reset_noise()  # Draw a new set of noisy weights
 
-      if T % args.evaluation_interval == 0:
-        dqn.eval()  # Set DQN (online network) to evaluation mode
-        avg_reward, avg_Q = test(args, T, dqn, val_mem, metrics, results_dir)  # Test
-        log('T = ' + str(T) + ' / ' + str(args.T_max) + ' | Avg. reward: ' + str(avg_reward) + ' | Avg. Q: ' + str(avg_Q))
-        dqn.train()  # Set DQN (online network) back to training mode
+      action = dqn.act(state)  # Choose an action greedily (with noisy weights)
+      next_state, reward, done = env.step(action)  # Step
+      _episode_reward += reward
+      if args.reward_clip > 0:
+        reward = max(min(reward, args.reward_clip), -args.reward_clip)  # Clip rewards
+      mem.append(state, action, reward, done)  # Append transition to memory
+      if done:
+        _csv.writerow([T, 'episode', round(_episode_reward, 1), 1, datetime.now().isoformat()])
+        _episode_reward = 0
 
-        # If memory path provided, save it
-        if args.memory is not None:
-          save_memory(mem, args.memory, args.disable_bzip_memory)
+      # Train and test
+      if T >= args.learn_start:
+        mem.priority_weight = min(mem.priority_weight + priority_weight_increase, 1)  # Anneal importance sampling weight β to 1
 
-      # Update target network
-      if T % args.target_update == 0:
-        dqn.update_target_net()
+        if T % args.replay_frequency == 0:
+          dqn.learn(mem)  # Train with n-step distributional double-Q learning
 
-      # Checkpoint the network
-      if (args.checkpoint_interval != 0) and (T % args.checkpoint_interval == 0):
-        dqn.save(results_dir, 'checkpoint.pth')
+        if T % args.evaluation_interval == 0:
+          dqn.eval()  # Set DQN (online network) to evaluation mode
+          env.close()  # stable_retro only allows one emulator instance per process
+          _csv.writerow([T, 'eval_start', '', '', datetime.now().isoformat()])
+          avg_reward, avg_Q = safe_test(args, T, dqn, val_mem, metrics, results_dir)  # Test
+          if avg_reward is not None:
+            _csv.writerow([T, 'eval_end', round(avg_reward, 4), '', datetime.now().isoformat()])
+            log('T = ' + str(T) + ' / ' + str(args.T_max) + ' | Avg. reward: ' + str(avg_reward) + ' | Avg. Q: ' + str(avg_Q))
+          else:
+            _csv.writerow([T, 'eval_timeout', '', '', datetime.now().isoformat()])
+          dqn.train()  # Set DQN (online network) back to training mode
+          env = Env(args)  # Reopen training env
+          env.train()
+          done = True  # Force reset on next step
 
-    state = next_state
+          # If memory path provided, save it
+          if args.memory is not None:
+            save_memory(mem, args.memory, args.disable_bzip_memory)
 
-env.close()
+        # Update target network
+        if T % args.target_update == 0:
+          dqn.update_target_net()
+
+        # Checkpoint the network
+        if (args.checkpoint_interval != 0) and (T % args.checkpoint_interval == 0):
+          dqn.save(results_dir, 'checkpoint.pth')
+
+      state = next_state
+
+  env.close()

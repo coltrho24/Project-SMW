@@ -17,8 +17,10 @@ def test(args, T, dqn, val_mem, metrics, results_dir, evaluate=False):
   T_rewards, T_Qs = [], []
 
   # Test performance over several episodes
+  max_steps_per_episode = getattr(args, 'evaluation_max_steps', 4500)
   done = True
   for _ in range(args.evaluation_episodes):
+    ep_steps = 0
     while True:
       if done:
         state, reward_sum, done = env.reset(), 0, False
@@ -26,11 +28,13 @@ def test(args, T, dqn, val_mem, metrics, results_dir, evaluate=False):
       action = dqn.act_e_greedy(state)  # Choose an action ε-greedily
       state, reward, done = env.step(action)  # Step
       reward_sum += reward
+      ep_steps += 1
       if args.render:
         env.render()
 
-      if done:
+      if done or ep_steps >= max_steps_per_episode:
         T_rewards.append(reward_sum)
+        done = True
         break
   env.close()
 
