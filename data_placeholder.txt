@@ -1,8 +1,0 @@
-    "lost powerup": {
-    },
-    "speed/velocity": {
-    },
-    "enemies defeated": {
-    },
-    "time remaining": {
-    }
