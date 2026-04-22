@@ -29,7 +29,15 @@
       "type": "<u4"
     },
     "x": {
-      "address": 8257745,
+      "address": 8257684,
+      "type": "<u2"
+    },
+    "y": {
+      "address": 8257752,
+      "type": "|u1"
+    },
+    "sprite1_x": {
+      "address": 8257764,
       "type": "|u1"
     },
     "screen": {
